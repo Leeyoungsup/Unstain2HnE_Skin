@@ -604,13 +604,18 @@ def background_losses(real_a, real_b, fake_a, fake_b, params):
     a_od = real_a_01.mean(dim=1, keepdim=True)
     mask_a = (a_od < params["a_background_od_threshold"]).to(real_a.dtype)
 
-    # Domain B background is bright and nearly achromatic RGB.
-    b_brightness = real_b_01.mean(dim=1, keepdim=True)
-    b_saturation = real_b_01.amax(dim=1, keepdim=True) - real_b_01.amin(dim=1, keepdim=True)
-    mask_b = (
-        (b_brightness > params["b_background_brightness_threshold"])
-        & (b_saturation < params["b_background_saturation_threshold"])
-    ).to(real_b.dtype)
+    if params.get("domain_b_mode", "rgb") == "od":
+        # H&E structure OD uses the same direction as Unstain OD: background is near 0.
+        b_od = real_b_01.mean(dim=1, keepdim=True)
+        mask_b = (b_od < params["b_background_od_threshold"]).to(real_b.dtype)
+    else:
+        # RGB H&E background is bright and nearly achromatic.
+        b_brightness = real_b_01.mean(dim=1, keepdim=True)
+        b_saturation = real_b_01.amax(dim=1, keepdim=True) - real_b_01.amin(dim=1, keepdim=True)
+        mask_b = (
+            (b_brightness > params["b_background_brightness_threshold"])
+            & (b_saturation < params["b_background_saturation_threshold"])
+        ).to(real_b.dtype)
 
     # Feather only the boundary; the masks are derived from real inputs and need no gradient.
     kernel = int(params.get("background_mask_blur_kernel", 5))
@@ -619,8 +624,9 @@ def background_losses(real_a, real_b, fake_a, fake_b, params):
         mask_a = F.avg_pool2d(mask_a, kernel, stride=1, padding=padding)
         mask_b = F.avg_pool2d(mask_b, kernel, stride=1, padding=padding)
 
-    # A background (-1) must become white H&E (+1); B background (+1) must become OD zero (-1).
-    loss_ab = masked_l1(fake_b_01, 1.0, mask_a)
+    # In OD↔OD both backgrounds are zero; in OD→RGB, A background becomes white.
+    target_b_background = 0.0 if params.get("domain_b_mode", "rgb") == "od" else 1.0
+    loss_ab = masked_l1(fake_b_01, target_b_background, mask_a)
     loss_ba = masked_l1(fake_a_01, 0.0, mask_b)
     return loss_ab, loss_ba, mask_a.mean(), mask_b.mean()
 
@@ -846,10 +852,16 @@ class CycleGANTrainer:
         return metrics, preview
 
     def save_preview(self, epoch, preview):
-        labels = [
-            "Unstain OD (A)", "Fake H&E (A→B)", "Paired Real H&E", "Recovered A",
-            "Real H&E (B)", "Fake Unstain (B→A)", "Paired Real A", "Recovered B",
-        ]
+        if self.params.get("domain_b_mode", "rgb") == "od":
+            labels = [
+                "Unstain OD (A)", "Fake H&E OD (A→B)", "Paired Real H&E OD", "Recovered A",
+                "Real H&E OD (B)", "Fake Unstain OD (B→A)", "Paired Real A", "Recovered B",
+            ]
+        else:
+            labels = [
+                "Unstain OD (A)", "Fake H&E (A→B)", "Paired Real H&E", "Recovered A",
+                "Real H&E (B)", "Fake Unstain (B→A)", "Paired Real A", "Recovered B",
+            ]
         rows = min(self.params["preview_count"], preview[0].shape[0])
         fig, axes = plt.subplots(rows, 8, figsize=(24, 3 * rows), squeeze=False)
         for row in range(rows):
