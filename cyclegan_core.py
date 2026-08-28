@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -201,7 +202,11 @@ class UnpairedCycleDataset(Dataset):
         self.a_paths = list(a_paths)
         self.b_paths = list(b_paths)
         self.cache = cache
-        self.crop_size = int(params["input_size"])
+        self.output_size = int(params["input_size"])
+        self.original_size = int(params["original_size"])
+        self.source_mpp = float(params.get("source_mpp", 0.5))
+        self.target_mpp = float(params.get("target_mpp", self.source_mpp))
+        self.view_size = round(self.output_size * self.target_mpp / self.source_mpp)
         self.od_max = float(od_max)
         self.retry_count = int(params["crop_retry_count"])
         self.min_fraction = float(params["min_crop_tissue_fraction"])
@@ -213,32 +218,45 @@ class UnpairedCycleDataset(Dataset):
 
         if self.background_probability + self.boundary_probability > 1:
             raise ValueError("background + boundary crop probabilities must be <= 1")
+        if self.view_size > self.original_size:
+            raise ValueError(
+                f"A {self.output_size}px output at {self.target_mpp} MPP requires a "
+                f"{self.view_size}px source view, larger than original_size={self.original_size}."
+            )
 
     def __len__(self):
         return max(len(self.a_paths), len(self.b_paths))
 
     def _view(self, path, domain):
         image = self.cache.get(path)
-        draw = random.random()
-        if draw < self.background_probability:
-            sampling_mode = "background"
-        elif draw < self.background_probability + self.boundary_probability:
-            sampling_mode = "boundary"
-        else:
-            sampling_mode = "tissue"
-        top, left = choose_tissue_crop(
-            image,
-            self.crop_size,
-            domain,
-            True,
-            self.retry_count,
-            self.min_fraction,
-            sampling_mode=sampling_mode,
-            background_max_fraction=self.background_max_fraction,
-            boundary_min_fraction=self.boundary_min_fraction,
-            boundary_max_fraction=self.boundary_max_fraction,
-        )
-        image = TF.crop(image, top, left, self.crop_size, self.crop_size)
+        if self.view_size < self.original_size:
+            draw = random.random()
+            if draw < self.background_probability:
+                sampling_mode = "background"
+            elif draw < self.background_probability + self.boundary_probability:
+                sampling_mode = "boundary"
+            else:
+                sampling_mode = "tissue"
+            top, left = choose_tissue_crop(
+                image,
+                self.view_size,
+                domain,
+                True,
+                self.retry_count,
+                self.min_fraction,
+                sampling_mode=sampling_mode,
+                background_max_fraction=self.background_max_fraction,
+                boundary_min_fraction=self.boundary_min_fraction,
+                boundary_max_fraction=self.boundary_max_fraction,
+            )
+            image = TF.crop(image, top, left, self.view_size, self.view_size)
+        if image.size != (self.output_size, self.output_size):
+            image = TF.resize(
+                image,
+                [self.output_size, self.output_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
         return spatial_augment(image)
 
     def __getitem__(self, index):
@@ -263,10 +281,19 @@ class PairedValidationDataset(Dataset):
         if not self.pairs:
             raise RuntimeError("No filename-matched validation pairs were found.")
         self.cache = cache
-        self.crop_size = int(params["input_size"])
+        self.output_size = int(params["input_size"])
+        self.original_size = int(params["original_size"])
+        self.source_mpp = float(params.get("source_mpp", 0.5))
+        self.target_mpp = float(params.get("target_mpp", self.source_mpp))
+        self.view_size = round(self.output_size * self.target_mpp / self.source_mpp)
         self.od_max = float(od_max)
         self.retry_count = int(params["crop_retry_count"])
         self.min_fraction = float(params["min_crop_tissue_fraction"])
+        if self.view_size > self.original_size:
+            raise ValueError(
+                f"A {self.output_size}px output at {self.target_mpp} MPP requires a "
+                f"{self.view_size}px source view, larger than original_size={self.original_size}."
+            )
 
     def __len__(self):
         return len(self.pairs)
@@ -274,16 +301,30 @@ class PairedValidationDataset(Dataset):
     def __getitem__(self, index):
         a_path, b_path = self.pairs[index]
         a_image, b_image = self.cache.get(a_path), self.cache.get(b_path)
-        top, left = choose_tissue_crop(
-            a_image,
-            self.crop_size,
-            "A",
-            False,
-            self.retry_count,
-            self.min_fraction,
-        )
-        a_image = TF.crop(a_image, top, left, self.crop_size, self.crop_size)
-        b_image = TF.crop(b_image, top, left, self.crop_size, self.crop_size)
+        if self.view_size < self.original_size:
+            top, left = choose_tissue_crop(
+                a_image,
+                self.view_size,
+                "A",
+                False,
+                self.retry_count,
+                self.min_fraction,
+            )
+            a_image = TF.crop(a_image, top, left, self.view_size, self.view_size)
+            b_image = TF.crop(b_image, top, left, self.view_size, self.view_size)
+        if a_image.size != (self.output_size, self.output_size):
+            a_image = TF.resize(
+                a_image,
+                [self.output_size, self.output_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            b_image = TF.resize(
+                b_image,
+                [self.output_size, self.output_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
         return unstain_to_od3(a_image, self.od_max), hne_to_tensor(b_image)
 
 
@@ -329,7 +370,9 @@ def build_dataloaders(params):
     )
     print(
         f"train A={len(train_a):,}, train B={len(train_b):,}, "
-        f"val pairs={len(val_set):,}, OD_MAX={od_max:.4f}"
+        f"val pairs={len(val_set):,}, OD_MAX={od_max:.4f}, "
+        f"view={train_set.view_size}px@{train_set.source_mpp}MPP "
+        f"-> {train_set.output_size}px@{train_set.target_mpp}MPP"
     )
     return train_loader, val_loader, od_max
 
@@ -470,6 +513,44 @@ def simple_ssim(x, y, window_size=11):
     return score.mean()
 
 
+def masked_l1(x, target, mask):
+    mask = mask.to(dtype=x.dtype)
+    channels = x.shape[1]
+    return ((x - target).abs() * mask).sum() / (mask.sum() * channels + 1e-6)
+
+
+def background_losses(real_a, real_b, fake_a, fake_b, params):
+    """Unpaired, source-derived background constraints for both directions."""
+    real_a_01 = denormalize(real_a)
+    real_b_01 = denormalize(real_b)
+    fake_a_01 = denormalize(fake_a)
+    fake_b_01 = denormalize(fake_b)
+
+    # Domain A contains the original OD direction: background is near 0 in [0, 1].
+    a_od = real_a_01.mean(dim=1, keepdim=True)
+    mask_a = (a_od < params["a_background_od_threshold"]).to(real_a.dtype)
+
+    # Domain B background is bright and nearly achromatic RGB.
+    b_brightness = real_b_01.mean(dim=1, keepdim=True)
+    b_saturation = real_b_01.amax(dim=1, keepdim=True) - real_b_01.amin(dim=1, keepdim=True)
+    mask_b = (
+        (b_brightness > params["b_background_brightness_threshold"])
+        & (b_saturation < params["b_background_saturation_threshold"])
+    ).to(real_b.dtype)
+
+    # Feather only the boundary; the masks are derived from real inputs and need no gradient.
+    kernel = int(params.get("background_mask_blur_kernel", 5))
+    if kernel > 1:
+        padding = kernel // 2
+        mask_a = F.avg_pool2d(mask_a, kernel, stride=1, padding=padding)
+        mask_b = F.avg_pool2d(mask_b, kernel, stride=1, padding=padding)
+
+    # A background (-1) must become white H&E (+1); B background (+1) must become OD zero (-1).
+    loss_ab = masked_l1(fake_b_01, 1.0, mask_a)
+    loss_ba = masked_l1(fake_a_01, 0.0, mask_b)
+    return loss_ab, loss_ba, mask_a.mean(), mask_b.mean()
+
+
 class CycleGANTrainer:
     def __init__(self, params, train_loader, val_loader, od_max, device):
         self.params = params
@@ -549,11 +630,15 @@ class CycleGANTrainer:
             cycle_b = self.l1(rec_b, real_b)
             identity_a = self.l1(idt_a, real_a)
             identity_b = self.l1(idt_b, real_b)
+            background_ab, background_ba, background_fraction_a, background_fraction_b = (
+                background_losses(real_a, real_b, fake_a, fake_b, self.params)
+            )
             loss_g = (
                 gan_ab
                 + gan_ba
                 + self.params["lambda_cycle"] * (cycle_a + cycle_b)
                 + self.params["lambda_identity"] * (identity_a + identity_b)
+                + self.params["lambda_background"] * (background_ab + background_ba)
             )
         self.scaler_g.scale(loss_g).backward()
         self.scaler_g.step(self.opt_g)
@@ -566,6 +651,10 @@ class CycleGANTrainer:
             "cycle_B": cycle_b.detach(),
             "identity_A": identity_a.detach(),
             "identity_B": identity_b.detach(),
+            "background_AB": background_ab.detach(),
+            "background_BA": background_ba.detach(),
+            "background_fraction_A": background_fraction_a.detach(),
+            "background_fraction_B": background_fraction_b.detach(),
         }, fake_a.detach(), fake_b.detach()
 
     def _discriminator_step(self, discriminator, optimizer, scaler, real, fake):
@@ -604,6 +693,7 @@ class CycleGANTrainer:
             pbar.set_postfix(
                 G=f"{totals['G'] / step:.3f}",
                 cycle=f"{(totals['cycle_A'] + totals['cycle_B']) / step:.3f}",
+                bg=f"{(totals['background_AB'] + totals['background_BA']) / step:.3f}",
                 D=f"{(totals['D_A'] + totals['D_B']) / (2 * step):.3f}",
             )
         return {key: value / len(self.train_loader) for key, value in totals.items()}
@@ -626,10 +716,17 @@ class CycleGANTrainer:
                 cycle_a = self.l1(rec_a, real_a)
                 cycle_b = self.l1(rec_b, real_b)
                 raw_ssim = simple_ssim(fake_b.float(), real_b.float())
+                background_ab, background_ba, background_fraction_a, background_fraction_b = (
+                    background_losses(real_a, real_b, fake_a, fake_b, self.params)
+                )
             batch = real_a.shape[0]
             totals["cycle_A"] += float(cycle_a) * batch
             totals["cycle_B"] += float(cycle_b) * batch
             totals["raw_paired_ssim"] += float(raw_ssim) * batch
+            totals["background_AB"] += float(background_ab) * batch
+            totals["background_BA"] += float(background_ba) * batch
+            totals["background_fraction_A"] += float(background_fraction_a) * batch
+            totals["background_fraction_B"] += float(background_fraction_b) * batch
             count += batch
             if preview is None:
                 preview = tuple(x.detach().float().cpu() for x in (real_a, fake_b, real_b, rec_a, real_b, fake_a, real_a, rec_b))
