@@ -182,6 +182,18 @@ def spatial_augment(image):
     return image
 
 
+def paired_spatial_augment(image_a, image_b):
+    angle = random.choice((0, 90, 180, 270))
+    if angle:
+        image_a = TF.rotate(image_a, angle)
+        image_b = TF.rotate(image_b, angle)
+    if random.random() < 0.5:
+        image_a, image_b = TF.hflip(image_a), TF.hflip(image_b)
+    if random.random() < 0.5:
+        image_a, image_b = TF.vflip(image_a), TF.vflip(image_b)
+    return image_a, image_b
+
+
 def unstain_to_od3(image, od_max):
     rgb = TF.to_tensor(image)
     gray = TF.rgb_to_grayscale(rgb, num_output_channels=1)
@@ -272,6 +284,63 @@ class UnpairedCycleDataset(Dataset):
         return a, b
 
 
+class PairedCycleDataset(Dataset):
+    """Filename-matched domains with the same field of view and augmentation."""
+
+    def __init__(self, a_paths, b_paths, cache, params, od_max):
+        b_by_name = {p.name: p for p in b_paths}
+        self.pairs = [(p, b_by_name[p.name]) for p in a_paths if p.name in b_by_name]
+        if not self.pairs:
+            raise RuntimeError("No filename-matched training pairs were found.")
+        self.cache = cache
+        self.output_size = int(params["input_size"])
+        self.original_size = int(params["original_size"])
+        self.source_mpp = float(params.get("source_mpp", 0.5))
+        self.target_mpp = float(params.get("target_mpp", self.source_mpp))
+        self.view_size = round(self.output_size * self.target_mpp / self.source_mpp)
+        self.od_max = float(od_max)
+        self.retry_count = int(params["crop_retry_count"])
+        self.min_fraction = float(params["min_crop_tissue_fraction"])
+        if self.view_size > self.original_size:
+            raise ValueError(
+                f"A {self.output_size}px output at {self.target_mpp} MPP requires a "
+                f"{self.view_size}px source view, larger than original_size={self.original_size}."
+            )
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, index):
+        a_path, b_path = self.pairs[index]
+        image_a, image_b = self.cache.get(a_path), self.cache.get(b_path)
+        if self.view_size < self.original_size:
+            top, left = choose_tissue_crop(
+                image_a,
+                self.view_size,
+                "A",
+                True,
+                self.retry_count,
+                self.min_fraction,
+            )
+            image_a = TF.crop(image_a, top, left, self.view_size, self.view_size)
+            image_b = TF.crop(image_b, top, left, self.view_size, self.view_size)
+        if image_a.size != (self.output_size, self.output_size):
+            image_a = TF.resize(
+                image_a,
+                [self.output_size, self.output_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            image_b = TF.resize(
+                image_b,
+                [self.output_size, self.output_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+        image_a, image_b = paired_spatial_augment(image_a, image_b)
+        return unstain_to_od3(image_a, self.od_max), hne_to_tensor(image_b)
+
+
 class PairedValidationDataset(Dataset):
     """Fixed corresponding crops are only for diagnostics; they never enter train loss."""
 
@@ -351,7 +420,12 @@ def build_dataloaders(params):
         params["od_quantile"],
         params["od_background_threshold"],
     )
-    train_set = UnpairedCycleDataset(train_a, train_b, cache, params, od_max)
+    if params.get("paired_training", False):
+        train_set = PairedCycleDataset(train_a, train_b, cache, params, od_max)
+        training_mode = "paired"
+    else:
+        train_set = UnpairedCycleDataset(train_a, train_b, cache, params, od_max)
+        training_mode = "unpaired"
     val_set = PairedValidationDataset(val_a, val_b, cache, params, od_max)
     train_loader = DataLoader(
         train_set,
@@ -371,7 +445,7 @@ def build_dataloaders(params):
     print(
         f"train A={len(train_a):,}, train B={len(train_b):,}, "
         f"val pairs={len(val_set):,}, OD_MAX={od_max:.4f}, "
-        f"view={train_set.view_size}px@{train_set.source_mpp}MPP "
+        f"mode={training_mode}, view={train_set.view_size}px@{train_set.source_mpp}MPP "
         f"-> {train_set.output_size}px@{train_set.target_mpp}MPP"
     )
     return train_loader, val_loader, od_max
@@ -551,6 +625,18 @@ def background_losses(real_a, real_b, fake_a, fake_b, params):
     return loss_ab, loss_ba, mask_a.mean(), mask_b.mean()
 
 
+def weak_blurred_l1(fake, real, params):
+    """Mildly registration-tolerant paired supervision in normalized space."""
+    kernel = int(params["paired_blur_kernel"])
+    if kernel % 2 == 0 or kernel < 1:
+        raise ValueError("paired_blur_kernel must be a positive odd integer")
+    sigma = float(params["paired_blur_sigma"])
+    if kernel > 1 and sigma > 0:
+        fake = TF.gaussian_blur(fake, [kernel, kernel], [sigma, sigma])
+        real = TF.gaussian_blur(real, [kernel, kernel], [sigma, sigma])
+    return F.l1_loss(fake, real)
+
+
 class CycleGANTrainer:
     def __init__(self, params, train_loader, val_loader, od_max, device):
         self.params = params
@@ -602,7 +688,7 @@ class CycleGANTrainer:
         self.scaler_d_b = torch.amp.GradScaler(device=device.type, enabled=self.amp_enabled)
         self.start_epoch = 0
         self.history = []
-        self.best_cycle = math.inf
+        self.best_score = math.inf
         if params.get("resume_checkpoint"):
             self.load(params["resume_checkpoint"])
 
@@ -633,12 +719,19 @@ class CycleGANTrainer:
             background_ab, background_ba, background_fraction_a, background_fraction_b = (
                 background_losses(real_a, real_b, fake_a, fake_b, self.params)
             )
+            if self.params.get("paired_training", False):
+                paired_blur_ab = weak_blurred_l1(fake_b, real_b, self.params)
+                paired_blur_ba = weak_blurred_l1(fake_a, real_a, self.params)
+            else:
+                paired_blur_ab = fake_b.new_zeros(())
+                paired_blur_ba = fake_a.new_zeros(())
             loss_g = (
                 gan_ab
                 + gan_ba
                 + self.params["lambda_cycle"] * (cycle_a + cycle_b)
                 + self.params["lambda_identity"] * (identity_a + identity_b)
                 + self.params["lambda_background"] * (background_ab + background_ba)
+                + self.params.get("lambda_paired_blur", 0.0) * (paired_blur_ab + paired_blur_ba)
             )
         self.scaler_g.scale(loss_g).backward()
         self.scaler_g.step(self.opt_g)
@@ -655,6 +748,8 @@ class CycleGANTrainer:
             "background_BA": background_ba.detach(),
             "background_fraction_A": background_fraction_a.detach(),
             "background_fraction_B": background_fraction_b.detach(),
+            "paired_blur_AB": paired_blur_ab.detach(),
+            "paired_blur_BA": paired_blur_ba.detach(),
         }, fake_a.detach(), fake_b.detach()
 
     def _discriminator_step(self, discriminator, optimizer, scaler, real, fake):
@@ -694,6 +789,7 @@ class CycleGANTrainer:
                 G=f"{totals['G'] / step:.3f}",
                 cycle=f"{(totals['cycle_A'] + totals['cycle_B']) / step:.3f}",
                 bg=f"{(totals['background_AB'] + totals['background_BA']) / step:.3f}",
+                pair=f"{(totals['paired_blur_AB'] + totals['paired_blur_BA']) / step:.3f}",
                 D=f"{(totals['D_A'] + totals['D_B']) / (2 * step):.3f}",
             )
         return {key: value / len(self.train_loader) for key, value in totals.items()}
@@ -719,6 +815,12 @@ class CycleGANTrainer:
                 background_ab, background_ba, background_fraction_a, background_fraction_b = (
                     background_losses(real_a, real_b, fake_a, fake_b, self.params)
                 )
+                if self.params.get("paired_training", False):
+                    paired_blur_ab = weak_blurred_l1(fake_b, real_b, self.params)
+                    paired_blur_ba = weak_blurred_l1(fake_a, real_a, self.params)
+                else:
+                    paired_blur_ab = fake_b.new_zeros(())
+                    paired_blur_ba = fake_a.new_zeros(())
             batch = real_a.shape[0]
             totals["cycle_A"] += float(cycle_a) * batch
             totals["cycle_B"] += float(cycle_b) * batch
@@ -727,17 +829,26 @@ class CycleGANTrainer:
             totals["background_BA"] += float(background_ba) * batch
             totals["background_fraction_A"] += float(background_fraction_a) * batch
             totals["background_fraction_B"] += float(background_fraction_b) * batch
+            totals["paired_blur_AB"] += float(paired_blur_ab) * batch
+            totals["paired_blur_BA"] += float(paired_blur_ba) * batch
             count += batch
             if preview is None:
                 preview = tuple(x.detach().float().cpu() for x in (real_a, fake_b, real_b, rec_a, real_b, fake_a, real_a, rec_b))
         metrics = {key: value / count for key, value in totals.items()}
         metrics["cycle_total"] = metrics["cycle_A"] + metrics["cycle_B"]
+        metrics["paired_blur_total"] = metrics["paired_blur_AB"] + metrics["paired_blur_BA"]
+        metrics["selection_score"] = (
+            self.params["lambda_cycle"] * metrics["cycle_total"]
+            + self.params.get("lambda_paired_blur", 0.0) * metrics["paired_blur_total"]
+            + self.params["lambda_background"]
+            * (metrics["background_AB"] + metrics["background_BA"])
+        )
         return metrics, preview
 
     def save_preview(self, epoch, preview):
         labels = [
-            "Unstain OD (A)", "Fake H&E (A→B)", "Real H&E (diagnostic)", "Recovered A",
-            "Real H&E (B)", "Fake Unstain (B→A)", "Real A (diagnostic)", "Recovered B",
+            "Unstain OD (A)", "Fake H&E (A→B)", "Paired Real H&E", "Recovered A",
+            "Real H&E (B)", "Fake Unstain (B→A)", "Paired Real A", "Recovered B",
         ]
         rows = min(self.params["preview_count"], preview[0].shape[0])
         fig, axes = plt.subplots(rows, 8, figsize=(24, 3 * rows), squeeze=False)
@@ -747,7 +858,7 @@ class CycleGANTrainer:
                 axes[row, col].imshow(image.clip(0, 1), cmap="gray" if col in (0, 3, 5, 6) else None)
                 axes[row, col].set_title(labels[col])
                 axes[row, col].axis("off")
-        fig.suptitle(f"Epoch {epoch + 1} — paired panels are diagnostics only", y=1.01)
+        fig.suptitle(f"Epoch {epoch + 1} — paired CycleGAN at {self.params['target_mpp']} MPP", y=1.01)
         fig.tight_layout()
         fig.savefig(self.output_dir / f"epoch_{epoch + 1:04d}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
@@ -769,11 +880,11 @@ class CycleGANTrainer:
             "od_max": self.od_max,
             "params": self.params,
             "history": self.history,
-            "best_cycle": self.best_cycle,
+            "best_score": self.best_score,
         }
         torch.save(state, self.checkpoint_dir / "latest.pt")
         if is_best:
-            torch.save(state, self.checkpoint_dir / "best_cycle.pt")
+            torch.save(state, self.checkpoint_dir / "best.pt")
         if (epoch + 1) % self.params["save_every"] == 0:
             torch.save(state, self.checkpoint_dir / f"epoch_{epoch + 1:04d}.pt")
 
@@ -793,7 +904,7 @@ class CycleGANTrainer:
                 getattr(self, scaler_name).load_state_dict(checkpoint[scaler_name])
         self.start_epoch = checkpoint["epoch"] + 1
         self.history = checkpoint.get("history", [])
-        self.best_cycle = checkpoint.get("best_cycle", math.inf)
+        self.best_score = checkpoint.get("best_score", checkpoint.get("best_cycle", math.inf))
         print(f"Resumed from epoch {self.start_epoch}")
 
     def fit(self):
@@ -809,14 +920,14 @@ class CycleGANTrainer:
                 "val": val_metrics,
             }
             self.history.append(row)
-            is_best = val_metrics["cycle_total"] < self.best_cycle
+            is_best = val_metrics["selection_score"] < self.best_score
             if is_best:
-                self.best_cycle = val_metrics["cycle_total"]
+                self.best_score = val_metrics["selection_score"]
             self.checkpoint(epoch, is_best)
             self.save_preview(epoch, preview)
             print("train:", {k: round(v, 4) for k, v in train_metrics.items()})
             print("val (diagnostic):", {k: round(v, 4) for k, v in val_metrics.items()})
             if is_best:
-                print(f"new best cycle checkpoint: epoch {epoch + 1}")
+                print(f"new best paired-cycle checkpoint: epoch {epoch + 1}")
             with (self.output_dir / "history.json").open("w") as file:
                 json.dump(self.history, file, indent=2)
