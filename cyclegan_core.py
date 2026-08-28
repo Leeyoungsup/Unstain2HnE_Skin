@@ -117,7 +117,18 @@ def tissue_fraction(image, domain, check_size=64, white_threshold=0.98):
     return float(np.mean((brightness < 0.92) | (saturation > 0.06)))
 
 
-def choose_tissue_crop(image, crop_size, domain, training, retry_count, min_fraction):
+def choose_tissue_crop(
+    image,
+    crop_size,
+    domain,
+    training,
+    retry_count,
+    min_fraction,
+    sampling_mode="tissue",
+    background_max_fraction=0.02,
+    boundary_min_fraction=0.02,
+    boundary_max_fraction=0.50,
+):
     width, height = image.size
     if width < crop_size or height < crop_size:
         raise ValueError(f"Image {image.size} is smaller than crop_size={crop_size}")
@@ -136,13 +147,25 @@ def choose_tissue_crop(image, crop_size, domain, training, retry_count, min_frac
             (max_top, max_left),
         ]
     best = candidates[0]
-    best_fraction = -1.0
+    best_score = -math.inf
+    boundary_target = (boundary_min_fraction + boundary_max_fraction) / 2
     for top, left in candidates:
         crop = TF.crop(image, top, left, crop_size, crop_size)
         fraction = tissue_fraction(crop, domain)
-        if fraction > best_fraction:
-            best, best_fraction = (top, left), fraction
-        if fraction >= min_fraction:
+
+        if sampling_mode == "background":
+            score = -fraction
+            accepted = fraction <= background_max_fraction
+        elif sampling_mode == "boundary":
+            score = -abs(fraction - boundary_target)
+            accepted = boundary_min_fraction <= fraction <= boundary_max_fraction
+        else:
+            score = fraction
+            accepted = fraction >= min_fraction
+
+        if score > best_score:
+            best, best_score = (top, left), score
+        if accepted:
             return top, left
     return best
 
@@ -163,6 +186,7 @@ def unstain_to_od3(image, od_max):
     gray = TF.rgb_to_grayscale(rgb, num_output_channels=1)
     od = -torch.log(gray.clamp(1 / 255, 1.0))
     od = (od / od_max).clamp(0, 1)
+    # Fixed global scaling: low-OD background -> -1, dense tissue -> +1.
     return (od * 2 - 1).repeat(3, 1, 1)
 
 
@@ -181,12 +205,27 @@ class UnpairedCycleDataset(Dataset):
         self.od_max = float(od_max)
         self.retry_count = int(params["crop_retry_count"])
         self.min_fraction = float(params["min_crop_tissue_fraction"])
+        self.background_probability = float(params.get("background_crop_probability", 0.10))
+        self.boundary_probability = float(params.get("boundary_crop_probability", 0.20))
+        self.background_max_fraction = float(params.get("background_max_tissue_fraction", 0.02))
+        self.boundary_min_fraction = float(params.get("boundary_min_tissue_fraction", 0.02))
+        self.boundary_max_fraction = float(params.get("boundary_max_tissue_fraction", 0.50))
+
+        if self.background_probability + self.boundary_probability > 1:
+            raise ValueError("background + boundary crop probabilities must be <= 1")
 
     def __len__(self):
         return max(len(self.a_paths), len(self.b_paths))
 
     def _view(self, path, domain):
         image = self.cache.get(path)
+        draw = random.random()
+        if draw < self.background_probability:
+            sampling_mode = "background"
+        elif draw < self.background_probability + self.boundary_probability:
+            sampling_mode = "boundary"
+        else:
+            sampling_mode = "tissue"
         top, left = choose_tissue_crop(
             image,
             self.crop_size,
@@ -194,6 +233,10 @@ class UnpairedCycleDataset(Dataset):
             True,
             self.retry_count,
             self.min_fraction,
+            sampling_mode=sampling_mode,
+            background_max_fraction=self.background_max_fraction,
+            boundary_min_fraction=self.boundary_min_fraction,
+            boundary_max_fraction=self.boundary_max_fraction,
         )
         image = TF.crop(image, top, left, self.crop_size, self.crop_size)
         return spatial_augment(image)
@@ -638,7 +681,9 @@ class CycleGANTrainer:
             torch.save(state, self.checkpoint_dir / f"epoch_{epoch + 1:04d}.pt")
 
     def load(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # This is a trusted, locally generated full training checkpoint containing
+        # optimizer state and Path-valued parameters, not a weights-only artifact.
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         for name in ("G_AB", "G_BA", "D_A", "D_B"):
             getattr(self, name).load_state_dict(checkpoint[name])
         self.opt_g.load_state_dict(checkpoint["opt_g"])
