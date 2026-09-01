@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import math
 import random
 from collections import defaultdict
@@ -17,13 +18,15 @@ from torchvision.transforms import InterpolationMode
 from tqdm.auto import tqdm
 
 from cyclegan_core import (
-    CycleGANTrainer,
+    ImagePool,
     PatchDiscriminator,
     RGBMemoryCache,
+    ResNetGenerator,
     denormalize,
     init_weights,
     masked_l1,
     paired_spatial_augment,
+    set_requires_grad,
     simple_ssim,
     slide_key,
 )
@@ -101,11 +104,11 @@ def estimate_global_od_max(cache, paths, params, label):
     return max(float(edges[bin_index + 1]), 0.05)
 
 
-def image_to_od3(image, od_max):
+def image_to_od(image, od_max):
     gray = TF.rgb_to_grayscale(TF.to_tensor(image), num_output_channels=1)
     od = -torch.log(gray.clamp(1 / 255, 1.0))
     od = (od / float(od_max)).clamp(0, 1)
-    return (od * 2 - 1).repeat(3, 1, 1)
+    return od * 2 - 1
 
 
 class TwoStagePairDataset(Dataset):
@@ -129,8 +132,8 @@ class TwoStagePairDataset(Dataset):
         hne = prepare_physical_view(self.cache.get(hne_path), self.params)
         if self.training:
             unstain, hne = paired_spatial_augment(unstain, hne)
-        unstain_od = image_to_od3(unstain, self.unstain_od_max)
-        hne_od = image_to_od3(hne, self.hne_od_max)
+        unstain_od = image_to_od(unstain, self.unstain_od_max)
+        hne_od = image_to_od(hne, self.hne_od_max)
         if self.mode == "structure":
             return unstain_od, hne_od
         hne_rgb = TF.to_tensor(hne) * 2 - 1
@@ -197,6 +200,260 @@ def build_two_stage_dataloaders(params):
     return result
 
 
+def od_gradient_loss(x, y):
+    x_dx, y_dx = x[:, :, :, 1:] - x[:, :, :, :-1], y[:, :, :, 1:] - y[:, :, :, :-1]
+    x_dy, y_dy = x[:, :, 1:, :] - x[:, :, :-1, :], y[:, :, 1:, :] - y[:, :, :-1, :]
+    return F.l1_loss(x_dx, y_dx) + F.l1_loss(x_dy, y_dy)
+
+
+class StructureCycleGANTrainer:
+    """True 1-channel paired CycleGAN for Unstain OD ↔ H&E OD."""
+
+    def __init__(self, params, train_loader, val_loader, od_max, device):
+        self.params = params
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.od_max = float(od_max)
+        self.device = device
+        self.output_dir = Path(params["output_dir"])
+        self.checkpoint_dir = Path(params["checkpoint_dir"])
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.G_AB = ResNetGenerator(1, params["ngf"], params["residual_blocks"]).to(device)
+        self.G_BA = ResNetGenerator(1, params["ngf"], params["residual_blocks"]).to(device)
+        self.D_A = PatchDiscriminator(1, params["ndf"]).to(device)
+        self.D_B = PatchDiscriminator(1, params["ndf"]).to(device)
+        for model in (self.G_AB, self.G_BA, self.D_A, self.D_B):
+            model.apply(init_weights)
+
+        self.opt_g = torch.optim.Adam(
+            itertools.chain(self.G_AB.parameters(), self.G_BA.parameters()),
+            lr=params["lr_g"], betas=(params["beta1"], params["beta2"]),
+        )
+        self.opt_d_a = torch.optim.Adam(
+            self.D_A.parameters(), lr=params["lr_d"], betas=(params["beta1"], params["beta2"])
+        )
+        self.opt_d_b = torch.optim.Adam(
+            self.D_B.parameters(), lr=params["lr_d"], betas=(params["beta1"], params["beta2"])
+        )
+
+        def lr_rule(epoch):
+            if epoch < params["decay_start_epoch"]:
+                return 1.0
+            span = max(1, params["num_epochs"] - params["decay_start_epoch"])
+            return max(0.0, 1.0 - (epoch - params["decay_start_epoch"] + 1) / span)
+
+        self.schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(opt, lr_rule)
+            for opt in (self.opt_g, self.opt_d_a, self.opt_d_b)
+        ]
+        self.gan_loss = nn.MSELoss()
+        self.l1 = nn.L1Loss()
+        self.pool_a = ImagePool(params["pool_size"])
+        self.pool_b = ImagePool(params["pool_size"])
+        self.amp_enabled = device.type == "cuda"
+        self.scaler_g = torch.amp.GradScaler(device=device.type, enabled=self.amp_enabled)
+        self.scaler_d_a = torch.amp.GradScaler(device=device.type, enabled=self.amp_enabled)
+        self.scaler_d_b = torch.amp.GradScaler(device=device.type, enabled=self.amp_enabled)
+        self.start_epoch = 0
+        self.history = []
+        self.best_score = math.inf
+        print(
+            f"1-channel structure G_AB={sum(p.numel() for p in self.G_AB.parameters()) / 1e6:.2f}M, "
+            f"D_B={sum(p.numel() for p in self.D_B.parameters()) / 1e6:.2f}M"
+        )
+
+    def background_losses(self, real_a, real_b, fake_a, fake_b):
+        real_a_01, real_b_01 = denormalize(real_a), denormalize(real_b)
+        mask_a = (real_a_01 < self.params["a_background_od_threshold"]).to(real_a.dtype)
+        mask_b = (real_b_01 < self.params["b_background_od_threshold"]).to(real_b.dtype)
+        kernel = int(self.params["background_mask_blur_kernel"])
+        if kernel > 1:
+            mask_a = F.avg_pool2d(mask_a, kernel, 1, kernel // 2)
+            mask_b = F.avg_pool2d(mask_b, kernel, 1, kernel // 2)
+        loss_ab = masked_l1(denormalize(fake_b), 0.0, mask_a)
+        loss_ba = masked_l1(denormalize(fake_a), 0.0, mask_b)
+        return loss_ab, loss_ba
+
+    def generator_step(self, real_a, real_b):
+        set_requires_grad([self.D_A, self.D_B], False)
+        self.opt_g.zero_grad(set_to_none=True)
+        with torch.amp.autocast(self.device.type, enabled=self.amp_enabled):
+            fake_b = self.G_AB(real_a)
+            fake_a = self.G_BA(real_b)
+            rec_a = self.G_BA(fake_b)
+            rec_b = self.G_AB(fake_a)
+            idt_a = self.G_BA(real_a)
+            idt_b = self.G_AB(real_b)
+
+            pred_b, pred_a = self.D_B(fake_b), self.D_A(fake_a)
+            gan_ab = self.gan_loss(pred_b, torch.ones_like(pred_b))
+            gan_ba = self.gan_loss(pred_a, torch.ones_like(pred_a))
+            cycle_a, cycle_b = self.l1(rec_a, real_a), self.l1(rec_b, real_b)
+            identity_a, identity_b = self.l1(idt_a, real_a), self.l1(idt_b, real_b)
+            paired_ab, paired_ba = self.l1(fake_b, real_b), self.l1(fake_a, real_a)
+            ssim_ab, ssim_ba = simple_ssim(fake_b, real_b), simple_ssim(fake_a, real_a)
+            gradient_ab = od_gradient_loss(fake_b, real_b)
+            gradient_ba = od_gradient_loss(fake_a, real_a)
+            background_ab, background_ba = self.background_losses(real_a, real_b, fake_a, fake_b)
+
+            loss_g = (
+                self.params["lambda_gan"] * (gan_ab + gan_ba)
+                + self.params["lambda_cycle"] * (cycle_a + cycle_b)
+                + self.params["lambda_identity"] * (identity_a + identity_b)
+                + self.params["lambda_paired"] * (paired_ab + paired_ba)
+                + self.params["lambda_ssim"] * ((1 - ssim_ab) + (1 - ssim_ba))
+                + self.params["lambda_gradient"] * (gradient_ab + gradient_ba)
+                + self.params["lambda_background"] * (background_ab + background_ba)
+            )
+        self.scaler_g.scale(loss_g).backward()
+        self.scaler_g.step(self.opt_g)
+        self.scaler_g.update()
+        metrics = {
+            "G": loss_g, "gan_AB": gan_ab, "gan_BA": gan_ba,
+            "cycle_A": cycle_a, "cycle_B": cycle_b,
+            "identity_A": identity_a, "identity_B": identity_b,
+            "paired_AB": paired_ab, "paired_BA": paired_ba,
+            "ssim_AB": ssim_ab, "ssim_BA": ssim_ba,
+            "gradient_AB": gradient_ab, "gradient_BA": gradient_ba,
+            "background_AB": background_ab, "background_BA": background_ba,
+        }
+        return {key: value.detach() for key, value in metrics.items()}, fake_a.detach(), fake_b.detach()
+
+    def discriminator_step(self, discriminator, optimizer, scaler, real, fake):
+        set_requires_grad(discriminator, True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast(self.device.type, enabled=self.amp_enabled):
+            pred_real, pred_fake = discriminator(real), discriminator(fake)
+            loss = 0.5 * (
+                self.gan_loss(pred_real, torch.ones_like(pred_real))
+                + self.gan_loss(pred_fake, torch.zeros_like(pred_fake))
+            )
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        return loss.detach()
+
+    def train_epoch(self, epoch):
+        for model in (self.G_AB, self.G_BA, self.D_A, self.D_B):
+            model.train()
+        totals = defaultdict(float)
+        pbar = tqdm(self.train_loader, desc=f"Structure epoch {epoch + 1}/{self.params['num_epochs']}")
+        for step, (real_a, real_b) in enumerate(pbar, start=1):
+            real_a = real_a.to(self.device, non_blocking=True)
+            real_b = real_b.to(self.device, non_blocking=True)
+            metrics, fake_a, fake_b = self.generator_step(real_a, real_b)
+            metrics["D_A"] = self.discriminator_step(
+                self.D_A, self.opt_d_a, self.scaler_d_a, real_a, self.pool_a.query(fake_a)
+            )
+            metrics["D_B"] = self.discriminator_step(
+                self.D_B, self.opt_d_b, self.scaler_d_b, real_b, self.pool_b.query(fake_b)
+            )
+            for key, value in metrics.items():
+                totals[key] += float(value)
+            pbar.set_postfix(
+                G=f"{totals['G'] / step:.3f}", D=f"{(totals['D_A'] + totals['D_B']) / (2 * step):.3f}",
+                pair=f"{totals['paired_AB'] / step:.3f}", SSIM=f"{totals['ssim_AB'] / step:.3f}",
+            )
+        return {key: value / len(self.train_loader) for key, value in totals.items()}
+
+    @torch.no_grad()
+    def validate(self):
+        self.G_AB.eval(); self.G_BA.eval()
+        totals = defaultdict(float)
+        count = 0
+        preview = None
+        for real_a, real_b in self.val_loader:
+            real_a = real_a.to(self.device, non_blocking=True)
+            real_b = real_b.to(self.device, non_blocking=True)
+            fake_b = self.G_AB(real_a)
+            fake_a = self.G_BA(real_b)
+            rec_a = self.G_BA(fake_b)
+            rec_b = self.G_AB(fake_a)
+            background_ab, background_ba = self.background_losses(real_a, real_b, fake_a, fake_b)
+            metrics = {
+                "paired_AB": self.l1(fake_b, real_b),
+                "paired_BA": self.l1(fake_a, real_a),
+                "ssim_AB": simple_ssim(fake_b, real_b),
+                "ssim_BA": simple_ssim(fake_a, real_a),
+                "gradient_AB": od_gradient_loss(fake_b, real_b),
+                "gradient_BA": od_gradient_loss(fake_a, real_a),
+                "cycle_A": self.l1(rec_a, real_a),
+                "cycle_B": self.l1(rec_b, real_b),
+                "background_AB": background_ab,
+                "background_BA": background_ba,
+            }
+            batch = real_a.shape[0]
+            for key, value in metrics.items():
+                totals[key] += float(value) * batch
+            count += batch
+            if preview is None:
+                preview = tuple(
+                    x.detach().float().cpu()
+                    for x in (real_a, fake_b, real_b, rec_a, real_b, fake_a, real_a, rec_b)
+                )
+        result = {key: value / count for key, value in totals.items()}
+        result["selection_score"] = (
+            result["paired_AB"] + (1 - result["ssim_AB"])
+            + 0.5 * result["gradient_AB"] + result["background_AB"]
+        )
+        return result, preview
+
+    def save_preview(self, epoch, preview):
+        labels = [
+            "Unstain OD", "Fake H&E OD", "Real H&E OD", "Recovered Unstain OD",
+            "Real H&E OD", "Fake Unstain OD", "Real Unstain OD", "Recovered H&E OD",
+        ]
+        rows = min(self.params["preview_count"], preview[0].shape[0])
+        fig, axes = plt.subplots(rows, 8, figsize=(24, 3 * rows), squeeze=False)
+        for row in range(rows):
+            for col, batch in enumerate(preview):
+                axes[row, col].imshow(denormalize(batch[row, 0]).numpy(), cmap="gray", vmin=0, vmax=1)
+                axes[row, col].set_title(labels[col])
+                axes[row, col].axis("off")
+        fig.suptitle(f"1-channel structure CycleGAN — epoch {epoch + 1}", y=1.01)
+        fig.tight_layout()
+        fig.savefig(self.output_dir / f"epoch_{epoch + 1:04d}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    def save_checkpoint(self, epoch, is_best):
+        state = {
+            "epoch": epoch, "G_AB": self.G_AB.state_dict(), "G_BA": self.G_BA.state_dict(),
+            "D_A": self.D_A.state_dict(), "D_B": self.D_B.state_dict(),
+            "opt_g": self.opt_g.state_dict(), "opt_d_a": self.opt_d_a.state_dict(),
+            "opt_d_b": self.opt_d_b.state_dict(),
+            "schedulers": [scheduler.state_dict() for scheduler in self.schedulers],
+            "history": self.history, "best_score": self.best_score,
+            "od_max": self.od_max, "params": self.params,
+        }
+        torch.save(state, self.checkpoint_dir / "latest.pt")
+        if is_best:
+            torch.save(state, self.checkpoint_dir / "best.pt")
+        if (epoch + 1) % self.params["save_every"] == 0:
+            torch.save(state, self.checkpoint_dir / f"epoch_{epoch + 1:04d}.pt")
+
+    def fit(self):
+        for epoch in range(self.start_epoch, self.params["num_epochs"]):
+            train_metrics = self.train_epoch(epoch)
+            val_metrics, preview = self.validate()
+            for scheduler in self.schedulers:
+                scheduler.step()
+            row = {"epoch": epoch + 1, "train": train_metrics, "val": val_metrics}
+            self.history.append(row)
+            is_best = val_metrics["selection_score"] < self.best_score
+            if is_best:
+                self.best_score = val_metrics["selection_score"]
+            self.save_checkpoint(epoch, is_best)
+            self.save_preview(epoch, preview)
+            print("train:", {k: round(v, 4) for k, v in train_metrics.items()})
+            print("val:", {k: round(v, 4) for k, v in val_metrics.items()})
+            if is_best:
+                print(f"new best forward H&E OD: epoch {epoch + 1}")
+            with (self.output_dir / "history.json").open("w") as file:
+                json.dump(self.history, file, indent=2)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -241,7 +498,7 @@ class UpBlock(nn.Module):
 class ODColorizer(nn.Module):
     def __init__(self, base=32):
         super().__init__()
-        self.e1 = ConvBlock(3, base)
+        self.e1 = ConvBlock(1, base)
         self.e2 = DownBlock(base, base * 2)
         self.e3 = DownBlock(base * 2, base * 4)
         self.e4 = DownBlock(base * 4, base * 8)
@@ -281,7 +538,7 @@ class ColorizerTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.G = ODColorizer(params["base_channels"]).to(device)
-        self.D = PatchDiscriminator(6, params["ndf"]).to(device)
+        self.D = PatchDiscriminator(4, params["ndf"]).to(device)
         self.G.apply(init_weights)
         self.D.apply(init_weights)
         self.opt_g = torch.optim.Adam(
@@ -442,8 +699,12 @@ class ColorizerTrainer:
         fig, axes = plt.subplots(rows, 6, figsize=(19, 3.2 * rows), squeeze=False)
         for row in range(rows):
             for col, batch in enumerate(preview):
-                image = denormalize(batch[row]).permute(1, 2, 0).numpy().clip(0, 1)
-                axes[row, col].imshow(image, cmap="gray" if col < 3 else None)
+                if batch.shape[1] == 1:
+                    image = denormalize(batch[row, 0]).numpy().clip(0, 1)
+                    axes[row, col].imshow(image, cmap="gray", vmin=0, vmax=1)
+                else:
+                    image = denormalize(batch[row]).permute(1, 2, 0).numpy().clip(0, 1)
+                    axes[row, col].imshow(image)
                 axes[row, col].set_title(labels[col])
                 axes[row, col].axis("off")
         fig.suptitle(f"Two-stage virtual H&E — color epoch {epoch + 1}", y=1.01)
@@ -494,11 +755,10 @@ class ColorizerTrainer:
 
 
 def build_structure_trainer(params, data, device):
-    return CycleGANTrainer(
+    return StructureCycleGANTrainer(
         params,
         data["structure_train"],
         data["structure_val"],
         data["unstain_od_max"],
         device,
     )
-
