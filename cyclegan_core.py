@@ -572,7 +572,7 @@ def denormalize(x):
 
 
 def simple_ssim(x, y, window_size=11):
-    """Diagnostic raw paired SSIM only; never used as a training objective."""
+    """Differentiable full-resolution SSIM score for training or diagnostics."""
     x, y = denormalize(x), denormalize(y)
     padding = window_size // 2
     mu_x = torch.nn.functional.avg_pool2d(x, window_size, 1, padding)
