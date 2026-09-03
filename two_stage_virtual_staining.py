@@ -133,11 +133,11 @@ class TwoStagePairDataset(Dataset):
         if self.training:
             unstain, hne = paired_spatial_augment(unstain, hne)
         unstain_od = image_to_od(unstain, self.unstain_od_max)
-        hne_od = image_to_od(hne, self.hne_od_max)
         if self.mode == "structure":
+            hne_od = image_to_od(hne, self.hne_od_max)
             return unstain_od, hne_od
         hne_rgb = TF.to_tensor(hne) * 2 - 1
-        return unstain_od, hne_od, hne_rgb
+        return unstain_od, hne_rgb
 
 
 def build_two_stage_dataloaders(params):
@@ -485,20 +485,41 @@ class DownBlock(nn.Module):
         return self.down(x)
 
 
+class DetailRefinementBlock(nn.Module):
+    """High-resolution residual refinement without normalization-induced smoothing."""
+
+    def __init__(self, channels, residual_scale=0.2):
+        super().__init__()
+        self.residual_scale = float(residual_scale)
+        self.detail = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+        )
+
+    def forward(self, x):
+        return x + self.residual_scale * self.detail(x)
+
+
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
+    def __init__(self, in_channels, skip_channels, out_channels, refine=False):
         super().__init__()
         self.conv = ConvBlock(in_channels + skip_channels, out_channels)
+        self.refine = DetailRefinementBlock(out_channels) if refine else nn.Identity()
 
     def forward(self, x, skip):
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        return self.conv(torch.cat([x, skip], dim=1))
+        return self.refine(self.conv(torch.cat([x, skip], dim=1)))
 
 
 class ODColorizer(nn.Module):
-    def __init__(self, base=32):
+    def __init__(self, base=32, input_channels=1, detail_refinement=False):
         super().__init__()
-        self.e1 = ConvBlock(1, base)
+        self.input_channels = int(input_channels)
+        self.detail_refinement = bool(detail_refinement)
+        self.e1 = ConvBlock(self.input_channels, base)
         self.e2 = DownBlock(base, base * 2)
         self.e3 = DownBlock(base * 2, base * 4)
         self.e4 = DownBlock(base * 4, base * 8)
@@ -506,10 +527,13 @@ class ODColorizer(nn.Module):
             DownBlock(base * 8, base * 8),
             ConvBlock(base * 8, base * 8),
         )
-        self.u4 = UpBlock(base * 8, base * 8, base * 8)
-        self.u3 = UpBlock(base * 8, base * 4, base * 4)
-        self.u2 = UpBlock(base * 4, base * 2, base * 2)
-        self.u1 = UpBlock(base * 2, base, base)
+        self.u4 = UpBlock(base * 8, base * 8, base * 8, self.detail_refinement)
+        self.u3 = UpBlock(base * 8, base * 4, base * 4, self.detail_refinement)
+        self.u2 = UpBlock(base * 4, base * 2, base * 2, self.detail_refinement)
+        self.u1 = UpBlock(base * 2, base, base, self.detail_refinement)
+        self.output_refine = (
+            DetailRefinementBlock(base) if self.detail_refinement else nn.Identity()
+        )
         self.output = nn.Sequential(
             nn.ReflectionPad2d(3), nn.Conv2d(base, 3, 7), nn.Tanh()
         )
@@ -520,7 +544,26 @@ class ODColorizer(nn.Module):
         e3 = self.e3(e2)
         e4 = self.e4(e3)
         b = self.bottleneck(e4)
-        return self.output(self.u1(self.u2(self.u3(self.u4(b, e4), e3), e2), e1))
+        x = self.u1(self.u2(self.u3(self.u4(b, e4), e3), e2), e1)
+        return self.output(self.output_refine(x))
+
+
+def rgb_gradient_loss(fake, real):
+    return od_gradient_loss(fake, real)
+
+
+def rgb_laplacian_loss(fake, real):
+    kernel = fake.new_tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]]
+    ).view(1, 1, 3, 3)
+    kernel = kernel.repeat(fake.shape[1], 1, 1, 1)
+    fake_laplacian = F.conv2d(
+        F.pad(fake, (1, 1, 1, 1), mode="reflect"), kernel, groups=fake.shape[1]
+    )
+    real_laplacian = F.conv2d(
+        F.pad(real, (1, 1, 1, 1), mode="reflect"), kernel, groups=real.shape[1]
+    )
+    return F.l1_loss(fake_laplacian, real_laplacian)
 
 
 class ColorizerTrainer:
@@ -537,8 +580,14 @@ class ColorizerTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        self.G = ODColorizer(params["base_channels"]).to(device)
-        self.D = PatchDiscriminator(4, params["ndf"]).to(device)
+        self.input_channels = int(params.get("input_channels", 1))
+        if self.input_channels != 1:
+            raise ValueError("Colorizer input must be predicted H&E OD only (1 channel).")
+        self.G = ODColorizer(
+            params["base_channels"], self.input_channels,
+            detail_refinement=params.get("detail_refinement", True),
+        ).to(device)
+        self.D = PatchDiscriminator(self.input_channels + 3, params["ndf"]).to(device)
         self.G.apply(init_weights)
         self.D.apply(init_weights)
         self.opt_g = torch.optim.Adam(
@@ -562,21 +611,6 @@ class ColorizerTrainer:
         self.history = []
         self.best_score = math.inf
 
-    def predicted_probability(self, epoch):
-        start = int(self.params["predicted_od_start_epoch"])
-        ramp = max(1, int(self.params["predicted_od_ramp_epochs"]))
-        if epoch < start:
-            return 0.0
-        return self.params["max_predicted_od_probability"] * min(1.0, (epoch - start + 1) / ramp)
-
-    @torch.no_grad()
-    def mix_od_inputs(self, unstain_od, real_hne_od, probability):
-        if probability <= 0:
-            return real_hne_od, real_hne_od
-        predicted = self.structure_generator(unstain_od)
-        mask = (torch.rand(unstain_od.shape[0], 1, 1, 1, device=self.device) < probability)
-        return torch.where(mask, predicted, real_hne_od), predicted
-
     def background_loss(self, hne_od, fake_rgb):
         od_01 = denormalize(hne_od).mean(dim=1, keepdim=True)
         mask = (od_01 < self.params["background_od_threshold"]).to(fake_rgb.dtype)
@@ -589,31 +623,33 @@ class ColorizerTrainer:
         self.G.train()
         self.D.train()
         self.structure_generator.eval()
-        probability = self.predicted_probability(epoch)
         totals = defaultdict(float)
         pbar = tqdm(self.train_loader, desc=f"Color epoch {epoch + 1}/{self.params['num_epochs']}")
-        for step, (unstain_od, real_hne_od, real_rgb) in enumerate(pbar, start=1):
+        for step, (unstain_od, real_rgb) in enumerate(pbar, start=1):
             unstain_od = unstain_od.to(self.device, non_blocking=True)
-            real_hne_od = real_hne_od.to(self.device, non_blocking=True)
             real_rgb = real_rgb.to(self.device, non_blocking=True)
-            input_od, _ = self.mix_od_inputs(unstain_od, real_hne_od, probability)
+            with torch.no_grad():
+                predicted_od = self.structure_generator(unstain_od)
+            condition = predicted_od
 
             for parameter in self.D.parameters():
                 parameter.requires_grad = False
             self.opt_g.zero_grad(set_to_none=True)
             with torch.amp.autocast(self.device.type, enabled=self.amp_enabled):
-                fake_rgb = self.G(input_od)
-                pred_fake = self.D(torch.cat([input_od, fake_rgb], dim=1))
+                fake_rgb = self.G(condition)
+                pred_fake = self.D(torch.cat([condition, fake_rgb], dim=1))
                 gan = self.gan_loss(pred_fake, torch.ones_like(pred_fake))
                 rgb_l1 = self.l1(fake_rgb, real_rgb)
-                fake_mid = F.interpolate(denormalize(fake_rgb), (256, 256), mode="area")
-                real_mid = F.interpolate(denormalize(real_rgb), (256, 256), mode="area")
-                ssim_loss = 1 - simple_ssim(fake_mid * 2 - 1, real_mid * 2 - 1)
-                background = self.background_loss(input_od, fake_rgb)
+                ssim_loss = 1 - simple_ssim(fake_rgb, real_rgb)
+                gradient = rgb_gradient_loss(fake_rgb, real_rgb)
+                laplacian = rgb_laplacian_loss(fake_rgb, real_rgb)
+                background = self.background_loss(predicted_od, fake_rgb)
                 loss_g = (
                     self.params["lambda_gan"] * gan
                     + self.params["lambda_rgb"] * rgb_l1
                     + self.params["lambda_ssim"] * ssim_loss
+                    + self.params["lambda_gradient"] * gradient
+                    + self.params["lambda_laplacian"] * laplacian
                     + self.params["lambda_background"] * background
                 )
             self.scaler_g.scale(loss_g).backward()
@@ -624,8 +660,8 @@ class ColorizerTrainer:
                 parameter.requires_grad = True
             self.opt_d.zero_grad(set_to_none=True)
             with torch.amp.autocast(self.device.type, enabled=self.amp_enabled):
-                pred_real = self.D(torch.cat([input_od, real_rgb], dim=1))
-                pred_fake = self.D(torch.cat([input_od, fake_rgb.detach()], dim=1))
+                pred_real = self.D(torch.cat([condition, real_rgb], dim=1))
+                pred_fake = self.D(torch.cat([condition, fake_rgb.detach()], dim=1))
                 loss_d = 0.5 * (
                     self.gan_loss(pred_real, torch.ones_like(pred_real))
                     + self.gan_loss(pred_fake, torch.zeros_like(pred_fake))
@@ -637,17 +673,16 @@ class ColorizerTrainer:
             metrics = {
                 "G": loss_g, "D": loss_d, "gan": gan, "rgb_l1": rgb_l1,
                 "ssim_loss": ssim_loss, "ssim_score": 1 - ssim_loss,
+                "gradient": gradient, "laplacian": laplacian,
                 "background": background,
             }
             for key, value in metrics.items():
                 totals[key] += float(value.detach())
             pbar.set_postfix(
                 G=f"{totals['G'] / step:.3f}", D=f"{totals['D'] / step:.3f}",
-                SSIM=f"{totals['ssim_score'] / step:.3f}", pred=f"{probability:.2f}",
+                SSIM=f"{totals['ssim_score'] / step:.3f}",
             )
-        result = {key: value / len(self.train_loader) for key, value in totals.items()}
-        result["predicted_od_probability"] = probability
-        return result
+        return {key: value / len(self.train_loader) for key, value in totals.items()}
 
     @torch.no_grad()
     def validate(self):
@@ -656,24 +691,22 @@ class ColorizerTrainer:
         totals = defaultdict(float)
         count = 0
         preview = None
-        for unstain_od, real_hne_od, real_rgb in self.val_loader:
+        for unstain_od, real_rgb in self.val_loader:
             unstain_od = unstain_od.to(self.device, non_blocking=True)
-            real_hne_od = real_hne_od.to(self.device, non_blocking=True)
             real_rgb = real_rgb.to(self.device, non_blocking=True)
             predicted_od = self.structure_generator(unstain_od)
             fake_predicted = self.G(predicted_od)
-            fake_oracle = self.G(real_hne_od)
             pred_l1 = self.l1(fake_predicted, real_rgb)
-            oracle_l1 = self.l1(fake_oracle, real_rgb)
             pred_ssim = simple_ssim(fake_predicted, real_rgb)
-            oracle_ssim = simple_ssim(fake_oracle, real_rgb)
+            gradient = rgb_gradient_loss(fake_predicted, real_rgb)
+            laplacian = rgb_laplacian_loss(fake_predicted, real_rgb)
             background = self.background_loss(predicted_od, fake_predicted)
             batch = unstain_od.shape[0]
             for key, value in {
                 "predicted_rgb_l1": pred_l1,
-                "oracle_rgb_l1": oracle_l1,
                 "predicted_ssim": pred_ssim,
-                "oracle_ssim": oracle_ssim,
+                "gradient": gradient,
+                "laplacian": laplacian,
                 "background": background,
             }.items():
                 totals[key] += float(value) * batch
@@ -681,22 +714,24 @@ class ColorizerTrainer:
             if preview is None:
                 preview = tuple(
                     x.detach().float().cpu()
-                    for x in (unstain_od, predicted_od, real_hne_od, fake_predicted, fake_oracle, real_rgb)
+                    for x in (unstain_od, predicted_od, fake_predicted, real_rgb)
                 )
         metrics = {key: value / count for key, value in totals.items()}
         metrics["selection_score"] = (
             metrics["predicted_rgb_l1"] + (1 - metrics["predicted_ssim"])
+            + 0.5 * metrics["gradient"] + 0.25 * metrics["laplacian"]
             + self.params["lambda_background"] * metrics["background"] / max(self.params["lambda_rgb"], 1)
         )
         return metrics, preview
 
     def save_preview(self, epoch, preview):
         labels = [
-            "Unstain OD", "Predicted H&E OD", "Real H&E OD",
-            "Final RGB from predicted OD", "RGB from real OD", "Real RGB H&E",
+            "Unstain OD (Stage 1 only)", "Predicted H&E OD",
+            "Final RGB from predicted OD", "Real RGB H&E",
         ]
         rows = min(self.params["preview_count"], preview[0].shape[0])
-        fig, axes = plt.subplots(rows, 6, figsize=(19, 3.2 * rows), squeeze=False)
+        columns = len(preview)
+        fig, axes = plt.subplots(rows, columns, figsize=(3.5 * columns, 3.2 * rows), squeeze=False)
         for row in range(rows):
             for col, batch in enumerate(preview):
                 if batch.shape[1] == 1:

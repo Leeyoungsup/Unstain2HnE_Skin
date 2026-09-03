@@ -37,7 +37,11 @@ def load_two_stage_models(structure_checkpoint, color_checkpoint, device=None):
         1, structure_params["ngf"], structure_params["residual_blocks"]
     )
     structure.load_state_dict(structure_state["G_AB"])
-    colorizer = ODColorizer(color_params["base_channels"])
+    color_input_channels = int(color_params.get("input_channels", 1))
+    colorizer = ODColorizer(
+        color_params["base_channels"], color_input_channels,
+        detail_refinement=color_params.get("detail_refinement", False),
+    )
     colorizer.load_state_dict(color_state["G_color"])
     structure = structure.to(device).eval()
     colorizer = colorizer.to(device).eval()
@@ -53,6 +57,7 @@ def load_two_stage_models(structure_checkpoint, color_checkpoint, device=None):
         "input_size": int(structure_params["input_size"]),
         "source_mpp": float(structure_params["source_mpp"]),
         "target_mpp": float(structure_params["target_mpp"]),
+        "color_input_channels": color_input_channels,
     }
     return structure, colorizer, metadata
 
@@ -68,7 +73,12 @@ def infer_batch(unstain_od, structure, colorizer, device):
     amp_enabled = torch.device(device).type == "cuda"
     with torch.amp.autocast(torch.device(device).type, enabled=amp_enabled):
         predicted_hne_od = structure(unstain_od)
-        generated_rgb = colorizer(predicted_hne_od)
+        color_input = (
+            torch.cat([unstain_od, predicted_hne_od], dim=1)
+            if getattr(colorizer, "input_channels", 1) == 2
+            else predicted_hne_od
+        )
+        generated_rgb = colorizer(color_input)
     return predicted_hne_od.float().cpu(), generated_rgb.float().cpu()
 
 
