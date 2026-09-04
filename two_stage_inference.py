@@ -134,11 +134,34 @@ def _read_target_tile(slide, x, y, tile_size, source_mpp, target_mpp, level):
     return rgb
 
 
-def _blend_window(tile_size):
-    axis = np.hanning(tile_size).astype(np.float32)
-    # Non-zero borders are required at the four outer WSI edges.
-    axis = np.maximum(axis, 0.05)
-    return np.outer(axis, axis).astype(np.float32)
+def _blend_axis(tile_size, overlap):
+    """Flat-centre cosine weights whose adjacent overlap sums to one."""
+    axis = np.ones(tile_size, dtype=np.float32)
+    if overlap == 0:
+        return axis
+    if overlap > tile_size // 2:
+        raise ValueError("cosine blending requires overlap <= tile_size / 2")
+    phase = (np.arange(overlap, dtype=np.float32) + 0.5) / overlap
+    ramp = 0.5 - 0.5 * np.cos(np.pi * phase)
+    axis[:overlap] = ramp
+    axis[-overlap:] = ramp[::-1]
+    return axis
+
+
+def _blend_window(tile_size, overlap, x, y, width, height):
+    """Position-aware window: taper internal seams, but retain the outer WSI edges."""
+    x_axis = _blend_axis(tile_size, overlap)
+    y_axis = _blend_axis(tile_size, overlap)
+    if overlap:
+        if x == 0:
+            x_axis[:overlap] = 1
+        if x + tile_size >= width:
+            x_axis[-overlap:] = 1
+        if y == 0:
+            y_axis[:overlap] = 1
+        if y + tile_size >= height:
+            y_axis[-overlap:] = 1
+    return np.outer(y_axis, x_axis).astype(np.float32)
 
 
 def _dilated_tissue_mask(gray, threshold, dilation):
@@ -160,7 +183,7 @@ def _tile_starts(length, tile_size, stride):
     return starts
 
 
-def save_pyramidal_tiff(rgb, output_path, mpp, jpeg_quality=90):
+def save_pyramidal_tiff(rgb, output_path, mpp, jpeg_quality=95):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
@@ -196,16 +219,21 @@ def infer_wsi(
     metadata,
     *,
     tile_size=512,
-    overlap=64,
+    overlap=256,
     batch_size=4,
     fallback_mpp=0.5,
     tissue_gray_threshold=0.98,
     minimum_tissue_fraction=0.002,
     white_background_threshold=0.995,
     background_dilation=31,
-    jpeg_quality=90,
+    jpeg_quality=95,
 ):
-    """Run overlap-tiled inference and save an OpenSlide-readable pyramidal TIFF."""
+    """Run seam-reduced overlap inference and save a pyramidal TIFF.
+
+    Generated tiles are blended before any background replacement.  Applying a
+    binary background mask independently to every tile creates visible seams,
+    so the source-derived mask is instead computed once in WSI coordinates.
+    """
     slide_path, output_path = Path(slide_path), Path(output_path)
     if not slide_path.is_file():
         raise FileNotFoundError(slide_path)
@@ -224,8 +252,6 @@ def infer_wsi(
         xs = _tile_starts(output_width, tile_size, stride)
         ys = _tile_starts(output_height, tile_size, stride)
         positions = [(x, y) for y in ys for x in xs]
-        window = _blend_window(tile_size)
-
         with tempfile.TemporaryDirectory(prefix="two_stage_wsi_") as temporary_dir:
             temporary_dir = Path(temporary_dir)
             accumulation = np.memmap(
@@ -236,10 +262,20 @@ def infer_wsi(
                 temporary_dir / "weight.float32", mode="w+", dtype=np.float32,
                 shape=(output_height, output_width),
             )
+            source_gray_accumulation = np.memmap(
+                temporary_dir / "source_gray.float32", mode="w+", dtype=np.float32,
+                shape=(output_height, output_width),
+            )
             accumulation[:] = 0
             weights[:] = 0
+            source_gray_accumulation[:] = 0
 
-            pending_images, pending_positions, pending_gray, pending_tissue = [], [], [], []
+            pending_images, pending_positions, pending_gray = [], [], []
+
+            def add_source_gray(gray, x, y, local_window, valid_h, valid_w):
+                source_gray_accumulation[y:y + valid_h, x:x + valid_w] += (
+                    gray[:valid_h, :valid_w] * local_window
+                )
 
             def flush_batch():
                 if not pending_images:
@@ -253,20 +289,21 @@ def infer_wsi(
                     ((generated.clamp(-1, 1) + 1) * 127.5)
                     .permute(0, 2, 3, 1).byte().numpy()
                 )
-                for rgb, gray, tissue, (x, y) in zip(
-                    generated, pending_gray, pending_tissue, pending_positions
+                for rgb, gray, (x, y) in zip(
+                    generated, pending_gray, pending_positions
                 ):
-                    rgb[~tissue] = 255
-                    rgb[gray >= white_background_threshold] = 255
                     valid_w = min(tile_size, output_width - x)
                     valid_h = min(tile_size, output_height - y)
-                    local_window = window[:valid_h, :valid_w]
+                    local_window = _blend_window(
+                        tile_size, overlap, x, y, output_width, output_height
+                    )[:valid_h, :valid_w]
                     accumulation[y:y + valid_h, x:x + valid_w] += (
                         rgb[:valid_h, :valid_w].astype(np.float32) * local_window[..., None]
                     )
                     weights[y:y + valid_h, x:x + valid_w] += local_window
+                    add_source_gray(gray, x, y, local_window, valid_h, valid_w)
                 pending_images.clear(); pending_positions.clear()
-                pending_gray.clear(); pending_tissue.clear()
+                pending_gray.clear()
 
             for x, y in tqdm(positions, desc=f"WSI inference at {target_mpp:g} MPP"):
                 image = _read_target_tile(
@@ -277,25 +314,37 @@ def infer_wsi(
                 if tissue_fraction < minimum_tissue_fraction:
                     valid_w = min(tile_size, output_width - x)
                     valid_h = min(tile_size, output_height - y)
-                    local_window = window[:valid_h, :valid_w]
+                    local_window = _blend_window(
+                        tile_size, overlap, x, y, output_width, output_height
+                    )[:valid_h, :valid_w]
                     accumulation[y:y + valid_h, x:x + valid_w] += 255 * local_window[..., None]
                     weights[y:y + valid_h, x:x + valid_w] += local_window
+                    add_source_gray(gray, x, y, local_window, valid_h, valid_w)
                     continue
                 pending_images.append(image)
                 pending_positions.append((x, y))
                 pending_gray.append(gray)
-                pending_tissue.append(
-                    _dilated_tissue_mask(gray, tissue_gray_threshold, background_dilation)
-                )
                 if len(pending_images) >= batch_size:
                     flush_batch()
             flush_batch()
 
             output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+            source_gray = np.empty((output_height, output_width), dtype=np.float32)
             for row in range(0, output_height, 512):
                 end = min(output_height, row + 512)
-                denominator = np.maximum(weights[row:end], 1e-6)[..., None]
-                output[row:end] = np.clip(accumulation[row:end] / denominator, 0, 255).astype(np.uint8)
+                denominator = np.maximum(weights[row:end], 1e-6)
+                output[row:end] = np.clip(
+                    accumulation[row:end] / denominator[..., None], 0, 255
+                ).astype(np.uint8)
+                source_gray[row:end] = source_gray_accumulation[row:end] / denominator
+
+            # No image blur is used here.  A single global source-derived mask
+            # merely restores true glass/background after all RGB tiles are blended.
+            global_tissue = _dilated_tissue_mask(
+                source_gray, tissue_gray_threshold, background_dilation
+            )
+            output[~global_tissue] = 255
+            output[source_gray >= white_background_threshold] = 255
 
     save_pyramidal_tiff(output, output_path, target_mpp, jpeg_quality)
     with openslide.OpenSlide(str(output_path)) as generated_slide:
@@ -311,4 +360,8 @@ def infer_wsi(
         "output_dimensions": saved_dimensions,
         "read_level": level,
         "tiles": len(positions),
+        "tile_size": tile_size,
+        "overlap": overlap,
+        "stride": stride,
+        "blend": "flat-centre cosine, global background mask",
     }

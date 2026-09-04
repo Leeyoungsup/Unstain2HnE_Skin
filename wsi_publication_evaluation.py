@@ -219,24 +219,40 @@ def _masked_ssim(candidate, reference, mask, window_size=11):
     candidate = candidate.astype(np.float32) / 255.0
     reference = reference.astype(np.float32) / 255.0
     c1, c2 = 0.01**2, 0.03**2
+    border_type = cv2.BORDER_REFLECT
     channel_scores = []
     for channel in range(3):
         x, y = candidate[..., channel], reference[..., channel]
         mu_x = cv2.boxFilter(
             x, -1, (window_size, window_size), normalize=True,
-            borderType=cv2.BORDER_REFLECT,
+            borderType=border_type,
         )
         mu_y = cv2.boxFilter(
             y, -1, (window_size, window_size), normalize=True,
-            borderType=cv2.BORDER_REFLECT,
+            borderType=border_type,
         )
-        sigma_x = cv2.boxFilter(x * x, -1, (window_size, window_size), normalize=True) - mu_x**2
-        sigma_y = cv2.boxFilter(y * y, -1, (window_size, window_size), normalize=True) - mu_y**2
-        sigma_xy = cv2.boxFilter(x * y, -1, (window_size, window_size), normalize=True) - mu_x * mu_y
+        sigma_x = cv2.boxFilter(
+            x * x, -1, (window_size, window_size), normalize=True,
+            borderType=border_type,
+        ) - mu_x**2
+        sigma_y = cv2.boxFilter(
+            y * y, -1, (window_size, window_size), normalize=True,
+            borderType=border_type,
+        ) - mu_y**2
+        sigma_xy = cv2.boxFilter(
+            x * y, -1, (window_size, window_size), normalize=True,
+            borderType=border_type,
+        ) - mu_x * mu_y
+        # Round-off can make a local variance slightly negative.  Enforcing the
+        # covariance bound keeps the standard SSIM map in its valid [-1, 1] range.
+        sigma_x = np.maximum(sigma_x, 0)
+        sigma_y = np.maximum(sigma_y, 0)
+        covariance_bound = np.sqrt(sigma_x * sigma_y)
+        sigma_xy = np.clip(sigma_xy, -covariance_bound, covariance_bound)
         score_map = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
             (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2) + 1e-12
         )
-        channel_scores.append(float(score_map[mask].mean()))
+        channel_scores.append(float(np.clip(score_map[mask], -1, 1).mean()))
     return float(np.mean(channel_scores))
 
 

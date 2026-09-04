@@ -35,6 +35,45 @@ def _thumbnail(rgb, maximum=768):
     )
 
 
+def _seam_discontinuity(rgb, stride, tissue_gray_threshold=245):
+    """Measure tile-boundary RGB jumps relative to nearby tissue transitions."""
+    height, width = rgb.shape[:2]
+    weighted = {"seam_sum": 0.0, "seam_n": 0, "control_sum": 0.0, "control_n": 0}
+
+    def accumulate(axis, index, prefix):
+        if axis == 1:
+            left, right = rgb[:, index - 1], rgb[:, index]
+        else:
+            left, right = rgb[index - 1], rgb[index]
+        mask = (
+            (left.astype(np.float32).mean(axis=1) < tissue_gray_threshold)
+            & (right.astype(np.float32).mean(axis=1) < tissue_gray_threshold)
+        )
+        count = int(mask.sum())
+        if count:
+            jump = float(
+                np.abs(left[mask].astype(np.float32) - right[mask].astype(np.float32)).mean()
+            )
+            weighted[f"{prefix}_sum"] += jump * count
+            weighted[f"{prefix}_n"] += count
+
+    for axis, length in ((1, width), (0, height)):
+        for boundary in range(int(stride), length, int(stride)):
+            accumulate(axis, boundary, "seam")
+            for offset in (-64, -32, -16, 16, 32, 64):
+                control = boundary + offset
+                if 1 <= control < length:
+                    accumulate(axis, control, "control")
+
+    seam = weighted["seam_sum"] / max(weighted["seam_n"], 1)
+    control = weighted["control_sum"] / max(weighted["control_n"], 1)
+    return {
+        "seam_jump": seam,
+        "nearby_jump": control,
+        "seam_ratio": seam / max(control, 1e-12),
+    }
+
+
 def _save_slide_comparison(
     slide,
     unstain,
@@ -148,10 +187,14 @@ def run_heldout_wsi_evaluation(
     *,
     reuse_existing=True,
     inference_batch_size=4,
+    inference_tile_size=512,
+    inference_overlap=256,
+    inference_jpeg_quality=95,
     deep_batch_size=8,
     tile_size=512,
     stride=512,
     minimum_tissue_fraction=0.10,
+    minimum_registration_iou=0.90,
     bootstrap_iterations=5000,
 ):
     output_dir = Path(output_dir)
@@ -179,8 +222,10 @@ def run_heldout_wsi_evaluation(
             if not (reuse_existing and generated_path.is_file()):
                 infer_wsi(
                     row["unstain_path"], generated_path, structure, colorizer, metadata,
-                    tile_size=512, overlap=64, batch_size=inference_batch_size,
+                    tile_size=inference_tile_size, overlap=inference_overlap,
+                    batch_size=inference_batch_size,
                     fallback_mpp=0.5, minimum_tissue_fraction=0.002,
+                    jpeg_quality=inference_jpeg_quality,
                 )
             unstain, _, registered, valid_mask, registration = register_real_hne_to_unstain(
                 row["unstain_path"], row["hne_path"], row["registration_path"],
@@ -188,6 +233,9 @@ def run_heldout_wsi_evaluation(
             )
             generated, _ = read_slide_at_mpp(
                 generated_path, metadata["target_mpp"], metadata["target_mpp"]
+            )
+            seam_metrics = _seam_discontinuity(
+                generated, inference_tile_size - inference_overlap
             )
             tile_metrics, tissue_mask, feature_payload = evaluate_wsi_tiles(
                 unstain, generated, registered, valid_mask,
@@ -215,12 +263,20 @@ def run_heldout_wsi_evaluation(
                 "reference": _thumbnail(registered),
             })
             quality = registration.get("registration_quality", {})
+            mask_iou = quality.get("mask_iou_after", np.nan)
             run_rows.append({
                 "case_id": row["case_id"], "slide": slide, "status": "ok",
                 "n_tiles": int(tile_metrics["comparison"].eq("Virtual H&E").sum()),
-                "mask_iou_after": quality.get("mask_iou_after", np.nan),
-                "ecc_after": quality.get("ecc_after", np.nan),
+                "mask_iou_after": mask_iou,
+                "ecc_score": quality.get("ecc_score", np.nan),
+                "registration_qc_pass": bool(
+                    np.isfinite(mask_iou) and mask_iou >= minimum_registration_iou
+                ),
                 "valid_fraction": registration.get("valid_fraction", np.nan),
+                "inference_tile_size": inference_tile_size,
+                "inference_overlap": inference_overlap,
+                "inference_stride": inference_tile_size - inference_overlap,
+                **seam_metrics,
                 "generated_path": str(generated_path),
                 "registered_hne_path": str(registered_path),
                 "comparison_path": str(comparison_path),
@@ -229,8 +285,13 @@ def run_heldout_wsi_evaluation(
         except Exception as error:
             run_rows.append({
                 "case_id": row["case_id"], "slide": slide, "status": "failed",
-                "n_tiles": 0, "mask_iou_after": np.nan, "ecc_after": np.nan,
+                "n_tiles": 0, "mask_iou_after": np.nan, "ecc_score": np.nan,
+                "registration_qc_pass": False,
                 "valid_fraction": np.nan, "generated_path": str(generated_path),
+                "inference_tile_size": inference_tile_size,
+                "inference_overlap": inference_overlap,
+                "inference_stride": inference_tile_size - inference_overlap,
+                "seam_jump": np.nan, "nearby_jump": np.nan, "seam_ratio": np.nan,
                 "registered_hne_path": str(registered_path),
                 "comparison_path": str(comparison_path),
                 "error": f"{type(error).__name__}: {error}",
@@ -245,6 +306,14 @@ def run_heldout_wsi_evaluation(
     slide_metrics, case_metrics, summary, improvement = summarize_cohort_metrics(
         tile_metrics, bootstrap_iterations=bootstrap_iterations, seed=42
     )
+    successful_runs = pd.DataFrame(run_rows).query("status == 'ok'")
+    qc_slides = successful_runs.loc[
+        successful_runs["registration_qc_pass"], "slide"
+    ].tolist()
+    qc_tile_metrics = tile_metrics[tile_metrics["slide"].isin(qc_slides)].copy()
+    qc_slide_metrics, qc_case_metrics, qc_summary, qc_improvement = summarize_cohort_metrics(
+        qc_tile_metrics, bootstrap_iterations=bootstrap_iterations, seed=42
+    )
     distribution = summarize_distribution_features(distribution_payloads, seed=42)
 
     outputs = {
@@ -254,6 +323,10 @@ def run_heldout_wsi_evaluation(
         "case_metrics": output_dir / "case_metrics.csv",
         "cohort_summary": output_dir / "cohort_metric_summary.csv",
         "cohort_improvement": output_dir / "cohort_metric_improvement.csv",
+        "qc_slide_metrics": output_dir / "qc_passed_slide_metrics.csv",
+        "qc_case_metrics": output_dir / "qc_passed_case_metrics.csv",
+        "qc_cohort_summary": output_dir / "qc_passed_cohort_metric_summary.csv",
+        "qc_cohort_improvement": output_dir / "qc_passed_cohort_metric_improvement.csv",
         "distribution_metrics": output_dir / "distribution_metrics.csv",
         "cohort_overview": output_dir / "cohort_wsi_overview.png",
         "cohort_metric_figure": output_dir / "cohort_metric_summary.png",
@@ -263,6 +336,10 @@ def run_heldout_wsi_evaluation(
     case_metrics.to_csv(outputs["case_metrics"], index=False)
     summary.to_csv(outputs["cohort_summary"], index=False)
     improvement.to_csv(outputs["cohort_improvement"], index=False)
+    qc_slide_metrics.to_csv(outputs["qc_slide_metrics"], index=False)
+    qc_case_metrics.to_csv(outputs["qc_case_metrics"], index=False)
+    qc_summary.to_csv(outputs["qc_cohort_summary"], index=False)
+    qc_improvement.to_csv(outputs["qc_cohort_improvement"], index=False)
     distribution.to_csv(outputs["distribution_metrics"], index=False)
     _save_cohort_overview(cohort_overview, outputs["cohort_overview"])
     _save_cohort_metric_figure(summary, outputs["cohort_metric_figure"])
@@ -273,6 +350,8 @@ def run_heldout_wsi_evaluation(
         "case_metrics": case_metrics,
         "cohort_summary": summary,
         "cohort_improvement": improvement,
+        "qc_cohort_summary": qc_summary,
+        "qc_cohort_improvement": qc_improvement,
         "distribution_metrics": distribution,
         "outputs": outputs,
     }
